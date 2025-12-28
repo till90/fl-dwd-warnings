@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fl-dwd-warnings (WFS) – DWD Warnpolygone + Kurztext + gültig bis
-- Web UI: AOI zeichnen (1 Feature), Warnungen laden, AOI/Warnungen als GeoJSON downloaden
-- API: POST /api/warnings  (GeoJSON -> Warnungen als GeoJSON FeatureCollection)
+fl-dwd-warnings (WFS) – DWD Warnpolygone (fixer Layer)
+- Web UI: AOI zeichnen (1 Feature) -> passende Warnungen (dwd:Warnungen_Gemeinden_vereinigt) laden
+         -> Warnungen auf Karte + Hover/Infobox + GeoJSON anzeigen + Download
+- API: POST /api/warnings  (GeoJSON -> GeoJSON FeatureCollection)
 
 Quelle (DWD GeoServer / WFS):
 - https://maps.dwd.de/geoserver/dwd/ows  (WFS 2.0.0)
 
 Hinweis CRS:
 - Frontend zeichnet in EPSG:4326 (Leaflet)
-- WFS BBOX Filter: srsName=CRS:84 (lon,lat)
+- WFS BBOX Filter: srsName=CRS:84 (lon,lat) -> gleiche Achsenreihenfolge (lon,lat)
 """
 
 from __future__ import annotations
@@ -40,12 +41,13 @@ SERVICE_SLUG = os.getenv("SERVICE_SLUG", "fl-dwd-warnings")
 
 DWD_WFS_BASE = os.getenv("DWD_WFS_BASE", "https://maps.dwd.de/geoserver/dwd/ows")
 DWD_WFS_VERSION = os.getenv("DWD_WFS_VERSION", "2.0.0")
-DWD_TYPENAME_DEFAULT = os.getenv("DWD_TYPENAME_DEFAULT", "dwd:Warnungen_Gemeinden_vereinigt")
+
+# FIX: nur dieser Layer
+DWD_TYPENAME = "dwd:Warnungen_Gemeinden_vereinigt"
 
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "25"))  # seconds
-MAX_FEATURES_DEFAULT = int(os.getenv("MAX_FEATURES_DEFAULT", "500"))
+MAX_FEATURES = int(os.getenv("MAX_FEATURES", "800"))   # bewusst simpel: kein UI-Feld, optional per ENV
 
-# in-memory cache
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "20"))
 MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "200"))
 
@@ -64,7 +66,6 @@ app.config["JSON_AS_ASCII"] = False
 
 @app.after_request
 def _add_headers(resp: Response) -> Response:
-    # API usability: allow cross-origin reads
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -190,7 +191,7 @@ def _geojson_feature_to_bbox_crs84(feature: Dict[str, Any]) -> Tuple[float, floa
     if not xs or not ys:
         raise ValueError("AOI enthält keine Koordinaten.")
 
-    # Leaflet liefert EPSG:4326 (lon,lat). Für WFS nutzen wir CRS:84 (lon,lat) => identische Achsenreihenfolge.
+    # Leaflet liefert EPSG:4326 (lon,lat). Für WFS nutzen wir CRS:84 (lon,lat) => identisch.
     return (min(xs), min(ys), max(xs), max(ys))
 
 
@@ -202,7 +203,6 @@ def _pick(props: Dict[str, Any], keys: List[str]) -> Optional[Any]:
 
 
 def _normalize_feature_properties(props: Dict[str, Any]) -> Dict[str, Any]:
-    # Defensive: Attribute variieren je nach Layer/Version.
     headline = _pick(props, ["HEADLINE", "headline", "Headline", "EVENT", "event", "DESCRIPTION", "description"])
     expires_raw = _pick(props, ["EXPIRES", "expires", "Expires", "GUELTIG_BIS", "gueltig_bis", "VALID_UNTIL", "valid_until"])
     onset_raw = _pick(props, ["ONSET", "onset", "Onset", "EFFECTIVE", "effective"])
@@ -222,7 +222,7 @@ def _normalize_feature_properties(props: Dict[str, Any]) -> Dict[str, Any]:
         "gebiet": area,
     }
 
-    # keep some ids if present
+    # ein paar häufig nützliche IDs, falls vorhanden
     for k in ["WARNCELLID", "warncellid", "ID", "id", "EC_II", "EC_GROUP", "EVENT", "STATUS", "MSGTYPE"]:
         if k in props and props.get(k) not in (None, ""):
             out[k] = props.get(k)
@@ -230,25 +230,26 @@ def _normalize_feature_properties(props: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _http_get(url: str, params: Dict[str, Any], accept: str) -> requests.Response:
     try:
-        r = requests.get(
+        return requests.get(
             url,
             params=params,
             timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json,application/geo+json,*/*"},
+            headers={"User-Agent": USER_AGENT, "Accept": accept},
         )
     except Exception as e:
-        raise RuntimeError(f"DWD WFS Request fehlgeschlagen: {e}")
+        raise RuntimeError(f"DWD Request fehlgeschlagen: {e}")
 
+
+def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = _http_get(url, params=params, accept="application/geo+json,application/json,*/*")
     ct = (r.headers.get("Content-Type") or "").lower()
     txt = r.text or ""
 
     if not r.ok:
-        # GeoServer liefert teils text/xml Fehler. Wir geben kurz aus.
         raise RuntimeError(f"DWD WFS Upstream HTTP {r.status_code}. Auszug: {txt[:900]}")
 
-    # Try JSON regardless of content-type (GeoServer ist manchmal inkonsistent).
     try:
         js = r.json()
     except Exception as e:
@@ -261,61 +262,59 @@ def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -------------------------------
-# In-memory cache
+# In-memory cache (GetFeature)
 # -------------------------------
 
 @dataclass
 class CacheEntry:
     ts: float
-    data: Dict[str, Any]
+    data: Any
 
 
-_cache: Dict[str, CacheEntry] = {}
+_feature_cache: Dict[str, CacheEntry] = {}
 
 
-def _cache_cleanup() -> None:
+def _feature_cache_cleanup() -> None:
     try:
         now = _now_ts()
-        # TTL cleanup
-        dead = [k for k, v in _cache.items() if (now - v.ts) > CACHE_TTL_SECONDS]
+        dead = [k for k, v in _feature_cache.items() if (now - v.ts) > CACHE_TTL_SECONDS]
         for k in dead:
-            _cache.pop(k, None)
+            _feature_cache.pop(k, None)
 
-        # size cap (drop oldest)
-        if len(_cache) > MAX_CACHE_ITEMS:
-            items = sorted(_cache.items(), key=lambda kv: kv[1].ts, reverse=True)
+        if len(_feature_cache) > MAX_CACHE_ITEMS:
+            items = sorted(_feature_cache.items(), key=lambda kv: kv[1].ts, reverse=True)
             keep = dict(items[:MAX_CACHE_ITEMS])
-            _cache.clear()
-            _cache.update(keep)
+            _feature_cache.clear()
+            _feature_cache.update(keep)
     except Exception:
         pass
 
 
-def _cache_key(typename: str, bbox: Tuple[float, float, float, float], max_features: int) -> str:
-    return f"{typename}|{bbox[0]:.6f},{bbox[1]:.6f},{bbox[2]:.6f},{bbox[3]:.6f}|{max_features}"
+def _feature_cache_key(bbox: Tuple[float, float, float, float], max_features: int) -> str:
+    return f"{DWD_TYPENAME}|{bbox[0]:.6f},{bbox[1]:.6f},{bbox[2]:.6f},{bbox[3]:.6f}|{max_features}"
 
 
 def _fetch_dwd_warnings_geojson(
-    typename: str,
     bbox: Tuple[float, float, float, float],
     max_features: int,
 ) -> Dict[str, Any]:
-    _cache_cleanup()
+    _feature_cache_cleanup()
 
-    key = _cache_key(typename, bbox, max_features)
+    key = _feature_cache_key(bbox, max_features)
     now = _now_ts()
 
-    hit = _cache.get(key)
+    hit = _feature_cache.get(key)
     if hit and (now - hit.ts) <= CACHE_TTL_SECONDS:
-        return hit.data
+        return hit.data  # type: ignore[return-value]
 
     minx, miny, maxx, maxy = bbox
 
+    # WFS 2.0.0: "typeNames" ist korrekt (GeoServer akzeptiert meist auch "typeName")
     params = {
         "service": "WFS",
         "version": DWD_WFS_VERSION,
         "request": "GetFeature",
-        "typeName": typename,
+        "typeNames": DWD_TYPENAME,
         "outputFormat": "application/json",
         "srsName": "CRS:84",
         "bbox": f"{minx},{miny},{maxx},{maxy},CRS:84",
@@ -327,15 +326,13 @@ def _fetch_dwd_warnings_geojson(
     if js.get("type") != "FeatureCollection":
         raise RuntimeError("DWD WFS lieferte keine GeoJSON FeatureCollection.")
 
-    _cache[key] = CacheEntry(ts=now, data=js)
+    _feature_cache[key] = CacheEntry(ts=now, data=js)
     return js
 
 
 def _build_featurecollection(
     raw_fc: Dict[str, Any],
-    typename: str,
     bbox: Tuple[float, float, float, float],
-    include_raw_props: bool,
 ) -> Dict[str, Any]:
     feats = raw_fc.get("features") or []
     out_feats: List[Dict[str, Any]] = []
@@ -345,24 +342,26 @@ def _build_featurecollection(
         if not isinstance(f, dict) or f.get("type") != "Feature":
             continue
 
-        props = f.get("properties") or {}
-        if not isinstance(props, dict):
-            props = {}
+        props_raw = f.get("properties") or {}
+        if not isinstance(props_raw, dict):
+            props_raw = {}
 
-        norm = _normalize_feature_properties(props)
-        if include_raw_props:
-            norm["properties_raw"] = props
+        norm = _normalize_feature_properties(props_raw)
+
+        # properties: norm + raw (damit UI "alle Informationen" anzeigen kann)
+        out_props = dict(norm)
+        out_props["properties_raw"] = props_raw
 
         out_feats.append({
             "type": "Feature",
             "geometry": f.get("geometry"),
-            "properties": norm,
+            "properties": out_props,
         })
 
         summary.append({
             "kurztext": norm.get("kurztext"),
-            "gueltig_bis": norm.get("gueltig_bis"),
-            "gueltig_bis_local": norm.get("gueltig_bis_local"),
+            "gueltig_ab_local": norm.get("gueltig_ab_local") or norm.get("gueltig_ab"),
+            "gueltig_bis_local": norm.get("gueltig_bis_local") or norm.get("gueltig_bis"),
             "severity": norm.get("severity"),
             "gebiet": norm.get("gebiet"),
         })
@@ -373,7 +372,7 @@ def _build_featurecollection(
         "meta": {
             "source": "DWD WFS",
             "endpoint": DWD_WFS_BASE,
-            "typeName": typename,
+            "typeName": DWD_TYPENAME,
             "bbox": list(bbox),
             "count": len(out_feats),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -391,20 +390,19 @@ def api_warnings():
     try:
         body = request.get_json(force=True, silent=False) or {}
 
-        # Backward compatible: accept "aoi" or "geojson"
-        gj = _parse_geojson(body.get("geojson") if body.get("geojson") is not None else body.get("aoi"))
-
-        typename = (body.get("typeName") or body.get("typename") or DWD_TYPENAME_DEFAULT).strip()
-        max_n = int(body.get("max", body.get("count", MAX_FEATURES_DEFAULT)))
-        max_n = max(1, min(max_n, 2000))
-
-        include_raw = bool(body.get("raw", False))
+        # akzeptiere: {geojson: ...} oder {aoi: ...} oder direkt GeoJSON
+        payload = body.get("geojson") if "geojson" in body else (body.get("aoi") if "aoi" in body else body)
+        gj = _parse_geojson(payload)
 
         feature = _extract_single_feature_geojson(gj)
         bbox = _geojson_feature_to_bbox_crs84(feature)
 
-        raw_fc = _fetch_dwd_warnings_geojson(typename=typename, bbox=bbox, max_features=max_n)
-        out_fc = _build_featurecollection(raw_fc, typename=typename, bbox=bbox, include_raw_props=include_raw)
+        # optional: API darf max übergeben (ohne UI), bleibt aber eingeschränkt
+        max_n = int(body.get("max", MAX_FEATURES))
+        max_n = max(1, min(max_n, 2000))
+
+        raw_fc = _fetch_dwd_warnings_geojson(bbox=bbox, max_features=max_n)
+        out_fc = _build_featurecollection(raw_fc, bbox=bbox)
 
         return jsonify(out_fc)
 
@@ -457,7 +455,7 @@ INDEX_HTML = r"""
     .panel{ padding: 12px; display:flex; flex-direction:column; gap: 10px; }
     label{ color: var(--muted); font-size: 12px; }
     textarea{
-      width: 100%; min-height: 180px; resize: vertical;
+      width: 100%; min-height: 160px; resize: vertical;
       background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 12px;
       padding: 10px; color: var(--text); font-family: var(--mono); font-size: 12px; outline: none;
     }
@@ -469,10 +467,6 @@ INDEX_HTML = r"""
     }
     button.primary{ border-color: rgba(110,168,254,.35); background: rgba(110,168,254,.16); }
     button:disabled{ opacity:.55; cursor:not-allowed; }
-    select,input{
-      background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 10px;
-      padding: 8px 10px; color: var(--text);
-    }
     .status{
       color: var(--muted); font-size: 13px; line-height: 1.35;
       padding: 8px 10px; border-radius: 12px; background: rgba(0,0,0,.18); border: 1px solid var(--border);
@@ -481,20 +475,35 @@ INDEX_HTML = r"""
     .err{ border-color: rgba(255,100,100,.35); background: rgba(255,100,100,.10); color: #ffd1d1; }
     .ok{ border-color: rgba(120,220,160,.35); background: rgba(120,220,160,.08); }
     .small{ font-size: 12px; color: var(--muted); }
+    .pill{ display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid var(--border); color: var(--muted); font-size: 12px; }
+    .mono{ font-family: var(--mono); }
     table{ width:100%; border-collapse: collapse; font-size: 12px; }
     th,td{ padding: 6px 6px; border-bottom: 1px solid rgba(255,255,255,.08); vertical-align: top; }
     th{ color: var(--muted); font-weight: 600; text-align:left; }
-    .mono{ font-family: var(--mono); }
-    .pill{ display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid var(--border); color: var(--muted); font-size: 12px; }
     .leaflet-control-attribution{ background:rgba(0,0,0,.45) !important; color:rgba(255,255,255,.75) !important; border-radius:10px !important; border:1px solid rgba(255,255,255,.12) !important;}
+    .infobox{
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px;
+      background: rgba(255,255,255,.03);
+    }
+    .kv{ display:grid; grid-template-columns: 140px 1fr; gap: 6px 10px; }
+    .k{ color: var(--muted); }
+    .v{ color: var(--text); overflow-wrap:anywhere; }
+    .divider{ height: 1px; background: rgba(255,255,255,.10); margin: 8px 0; }
   </style>
+
+  <script>
+    const FIX_TYPENAME = {{ typename_json|safe }};
+    const SERVICE_SLUG = {{ service_slug_json|safe }};
+  </script>
 </head>
 <body>
   <header>
     <div>
       <h1>{{ title }}</h1>
       <div class="hint">
-        Zeichne ein Polygon/Rechteck (immer nur <b>ein</b> Feature). Lade Warnungen via WFS und exportiere als GeoJSON.
+        Zeichne ein Polygon/Rechteck (immer nur <b>ein</b> Feature). Danach <b>Warnungen laden</b> (Layer fix: <span class="mono">{{ typename }}</span>).
         <span class="pill">AOI: EPSG:4326</span> <span class="pill">WFS: CRS:84</span>
       </div>
     </div>
@@ -513,30 +522,27 @@ INDEX_HTML = r"""
           <button id="btn-dl-aoi" disabled>AOI downloaden</button>
         </div>
 
-        <div class="row">
-          <label>typeName:
-            <input id="typeName" value="{{ typename_default }}" style="width: 320px;">
-          </label>
-          <label>Max:
-            <input id="maxN" type="number" min="1" max="2000" value="{{ max_default }}" style="width: 120px;">
-          </label>
-        </div>
-
         <div id="status" class="status">Noch keine AOI.</div>
 
-        <label>GeoJSON (aktuelles Feature, EPSG:4326)</label>
-        <textarea id="geojson" spellcheck="false" placeholder="Hier erscheint das GeoJSON…"></textarea>
-
-        <div class="small">
-          Beispiele typeName:
-          <span class="pill">dwd:Warnungen_Gemeinden_vereinigt</span>
-          <span class="pill">dwd:Warnungen_Gemeinden</span>
-          <span class="pill">dwd:Warnungen_Landkreise</span>
+        <div class="infobox" id="infoBox">
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline;">
+            <div style="font-weight:700;">Info</div>
+            <div class="small">Hover über eine Warnfläche</div>
+          </div>
+          <div class="divider"></div>
+          <div class="small" id="infoHint">Noch keine Warnung geladen.</div>
+          <div id="infoContent" style="display:none;"></div>
         </div>
 
-        <div id="warnBox" style="display:none; margin-top:10px;">
-          <div class="small">Warnungen (<span id="warnCount">0</span>):</div>
-          <div style="max-height: 320px; overflow:auto; margin-top:6px;">
+        <label>AOI GeoJSON (EPSG:4326)</label>
+        <textarea id="geojsonAoi" spellcheck="false" placeholder="Hier erscheint das AOI-GeoJSON…"></textarea>
+
+        <label>Warnungen GeoJSON (letzter Abruf)</label>
+        <textarea id="geojsonWarn" spellcheck="false" placeholder="Hier erscheint das Warnungen-GeoJSON…"></textarea>
+
+        <div id="warnBox" style="display:none; margin-top:6px;">
+          <div class="small">Treffer (<span id="warnCount">0</span>) – klick in Tabelle zoomt zur Warnung:</div>
+          <div style="max-height: 240px; overflow:auto; margin-top:6px;">
             <table id="warnTable">
               <thead>
                 <tr>
@@ -548,6 +554,9 @@ INDEX_HTML = r"""
           </div>
         </div>
 
+        <div class="small">
+          Layer ist fest verdrahtet: <span class="mono">{{ typename }}</span>.
+        </div>
       </div>
     </div>
   </div>
@@ -565,44 +574,9 @@ INDEX_HTML = r"""
 
     const drawn = new L.FeatureGroup().addTo(map);
 
-    const warningsLayer = L.geoJSON([], {
-      style: (f) => {
-        const p = (f && f.properties) ? f.properties : {};
-        const sev = (p.severity || '').toString().toLowerCase();
-        let weight = 2, opacity = 0.9, fillOpacity = 0.22;
-        let color = '#6ea8fe';
-        if(sev.includes('4') || sev.includes('extrem')) color = '#ff6b6b';
-        else if(sev.includes('3') || sev.includes('unwetter')) color = '#ffb347';
-        else if(sev.includes('2') || sev.includes('markant')) color = '#ffd166';
-        else if(sev.includes('1')) color = '#54d18a';
-        return { color, weight, opacity, fillOpacity };
-      },
-      onEachFeature: (feature, layer) => {
-        const p = feature.properties || {};
-        const t = (p.kurztext || '(ohne Kurztext)').toString();
-        const vb = (p.gueltig_bis_local || p.gueltig_bis || 'n/a').toString();
-        const area = (p.gebiet || '').toString();
-        const sev = (p.severity || '').toString();
-
-        const html = `
-          <div style="font-family:system-ui; font-size:12px; line-height:1.35; max-width:300px;">
-            <div style="font-weight:700; margin-bottom:4px;">${escapeHtml(t)}</div>
-            <div style="opacity:.9;">Gültig bis: <b>${escapeHtml(vb)}</b></div>
-            ${area ? `<div style="opacity:.8; margin-top:2px;">Gebiet: ${escapeHtml(area)}</div>` : ``}
-            ${sev ? `<div style="opacity:.8; margin-top:2px;">Severity: ${escapeHtml(sev)}</div>` : ``}
-          </div see
-        `;
-        layer.bindPopup(html);
-      }
-    }).addTo(map);
-
-    const drawControl = new L.Control.Draw({
-      draw: { polyline:false, circle:false, circlemarker:false, marker:false, polygon:{ allowIntersection:false, showArea:true }, rectangle:true },
-      edit: { featureGroup: drawn, edit:true, remove:true }
-    });
-    map.addControl(drawControl);
-
-    const elGeo = document.getElementById('geojson');
+    // ---- UI refs
+    const elAoi = document.getElementById('geojsonAoi');
+    const elWarn = document.getElementById('geojsonWarn');
     const elStatus = document.getElementById('status');
 
     const btnClear = document.getElementById('btn-clear');
@@ -610,14 +584,18 @@ INDEX_HTML = r"""
     const btnDlWarn = document.getElementById('btn-dl-warn');
     const btnDlAoi = document.getElementById('btn-dl-aoi');
 
-    const elTypeName = document.getElementById('typeName');
-    const elMaxN = document.getElementById('maxN');
-
     const warnBox = document.getElementById('warnBox');
     const warnCount = document.getElementById('warnCount');
     const warnTableBody = document.querySelector('#warnTable tbody');
 
-    let currentFeature = null;
+    const infoBox = document.getElementById('infoBox');
+    const infoHint = document.getElementById('infoHint');
+    const infoContent = document.getElementById('infoContent');
+
+    // ---- state
+    let currentAOILayer = null;
+    let lastWarningsFC = null;
+    let featureIndex = []; // [{id, layer, props, bounds}...]
 
     function setStatus(html, cls){
       elStatus.className = 'status' + (cls ? (' ' + cls) : '');
@@ -633,92 +611,184 @@ INDEX_HTML = r"""
         .replaceAll("'","&#039;");
     }
 
+    function setButtons(){
+      const hasAOI = !!currentAOILayer;
+      btnLoad.disabled = !hasAOI;
+      btnDlWarn.disabled = !lastWarningsFC;
+      btnDlAoi.disabled = !hasAOI;
+    }
+
     function featureToGeoJSON(layer){
       return { type:"Feature", properties:{ epsg: 4326 }, geometry: layer.toGeoJSON().geometry };
     }
 
-    function setButtons(){
-      const hasFeature = !!currentFeature;
-      btnLoad.disabled = !hasFeature;
-      btnDlWarn.disabled = !hasFeature;
-      btnDlAoi.disabled = !hasFeature;
+    function clearWarningsUI(){
+      warningsLayer.clearLayers();
+      lastWarningsFC = null;
+      featureIndex = [];
+      elWarn.value = '';
+      warnBox.style.display = 'none';
+      warnCount.textContent = '0';
+      warnTableBody.innerHTML = '';
+      infoHint.textContent = 'Noch keine Warnung geladen.';
+      infoContent.style.display = 'none';
+      infoContent.innerHTML = '';
+      setButtons();
     }
 
     function clearAll(){
       drawn.clearLayers();
-      warningsLayer.clearLayers();
-
-      currentFeature = null;
-      elGeo.value = '';
-
-      warnBox.style.display = 'none';
-      warnCount.textContent = '0';
-      warnTableBody.innerHTML = '';
-
-      setButtons();
+      currentAOILayer = null;
+      elAoi.value = '';
+      clearWarningsUI();
       setStatus('Noch keine AOI.', '');
+      setButtons();
     }
+
+    btnClear.addEventListener('click', clearAll);
+
+    // ---- warnings layer with hover -> right infobox
+    function baseStyle(p){
+      const sev = (p && p.severity ? String(p.severity) : '').toLowerCase();
+      let weight = 2, opacity = 0.9, fillOpacity = 0.22;
+      let color = '#6ea8fe';
+      if(sev.includes('4') || sev.includes('extrem')) color = '#ff6b6b';
+      else if(sev.includes('3') || sev.includes('unwetter')) color = '#ffb347';
+      else if(sev.includes('2') || sev.includes('markant')) color = '#ffd166';
+      else if(sev.includes('1')) color = '#54d18a';
+      return { color, weight, opacity, fillOpacity };
+    }
+
+    const warningsLayer = L.geoJSON([], {
+      style: (f) => baseStyle((f && f.properties) ? f.properties : {}),
+      onEachFeature: (feature, layer) => {
+        const p = feature.properties || {};
+        const t = (p.kurztext || '(ohne Kurztext)').toString();
+        const vb = (p.gueltig_bis_local || p.gueltig_bis || 'n/a').toString();
+        const area = (p.gebiet || '').toString();
+        const sev = (p.severity || '').toString();
+
+        const popup = `
+          <div style="font-family:system-ui; font-size:12px; line-height:1.35; max-width:320px;">
+            <div style="font-weight:700; margin-bottom:4px;">${escapeHtml(t)}</div>
+            <div style="opacity:.9;">Gültig bis: <b>${escapeHtml(vb)}</b></div>
+            ${area ? `<div style="opacity:.8; margin-top:2px;">Gebiet: ${escapeHtml(area)}</div>` : ``}
+            ${sev ? `<div style="opacity:.8; margin-top:2px;">Severity: ${escapeHtml(sev)}</div>` : ``}
+          </div>
+        `;
+        layer.bindPopup(popup);
+
+        layer.on('mouseover', () => {
+          try{
+            layer.setStyle({ weight: 4, fillOpacity: 0.30 });
+            if(!L.Browser.ie && !L.Browser.opera && !L.Browser.edge) layer.bringToFront();
+          }catch(_){}
+          renderInfo(p);
+        });
+
+        layer.on('mouseout', () => {
+          try{
+            layer.setStyle(baseStyle(p));
+          }catch(_){}
+        });
+
+        layer.on('click', () => renderInfo(p));
+      }
+    }).addTo(map);
+
+    function renderInfo(p){
+      if(!p){
+        infoHint.textContent = 'Keine Informationen.';
+        infoContent.style.display = 'none';
+        infoContent.innerHTML = '';
+        return;
+      }
+      infoHint.textContent = '';
+      const raw = p.properties_raw || {};
+      const keysRaw = Object.keys(raw || {}).sort((a,b)=>a.localeCompare(b));
+
+      const head = `
+        <div class="kv">
+          <div class="k">Kurztext</div><div class="v"><b>${escapeHtml(p.kurztext || '(ohne)')}</b></div>
+          <div class="k">Gültig ab</div><div class="v">${escapeHtml(p.gueltig_ab_local || p.gueltig_ab || 'n/a')}</div>
+          <div class="k">Gültig bis</div><div class="v">${escapeHtml(p.gueltig_bis_local || p.gueltig_bis || 'n/a')}</div>
+          <div class="k">Severity</div><div class="v">${escapeHtml(p.severity ?? '')}</div>
+          <div class="k">Gebiet</div><div class="v">${escapeHtml(p.gebiet ?? '')}</div>
+        </div>
+        <div class="divider"></div>
+        <div class="small" style="margin-bottom:6px;">Alle Attribute (raw):</div>
+      `;
+
+      let rawHtml = `<div class="kv">`;
+      for(const k of keysRaw){
+        const v = raw[k];
+        rawHtml += `<div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(typeof v === 'string' ? v : JSON.stringify(v))}</div>`;
+      }
+      rawHtml += `</div>`;
+
+      infoContent.innerHTML = head + rawHtml;
+      infoContent.style.display = 'block';
+    }
+
+    // ---- draw control
+    const drawControl = new L.Control.Draw({
+      draw: { polyline:false, circle:false, circlemarker:false, marker:false,
+              polygon:{ allowIntersection:false, showArea:true }, rectangle:true },
+      edit: { featureGroup: drawn, edit:true, remove:true }
+    });
+    map.addControl(drawControl);
 
     map.on(L.Draw.Event.CREATED, function(e){
       drawn.clearLayers();
-      warningsLayer.clearLayers();
+      currentAOILayer = e.layer;
+      drawn.addLayer(currentAOILayer);
 
-      warnBox.style.display = 'none';
-      warnCount.textContent = '0';
-      warnTableBody.innerHTML = '';
+      const gj = featureToGeoJSON(currentAOILayer);
+      elAoi.value = JSON.stringify(gj, null, 2);
 
-      const layer = e.layer;
-      drawn.addLayer(layer);
-      currentFeature = layer;
-
-      const gj = featureToGeoJSON(layer);
-      elGeo.value = JSON.stringify(gj, null, 2);
+      clearWarningsUI();
 
       try{
         const b = L.geoJSON(gj).getBounds();
         if(b.isValid()) map.fitBounds(b.pad(0.2));
       }catch(_){}
 
-      setButtons();
       setStatus('AOI gesetzt. Jetzt <b>Warnungen laden</b>.', 'ok');
+      setButtons();
     });
 
     map.on('draw:edited', function(){
       const layers = drawn.getLayers();
       if(!layers.length) return;
 
-      currentFeature = layers[0];
-      const gj = featureToGeoJSON(currentFeature);
-      elGeo.value = JSON.stringify(gj, null, 2);
+      currentAOILayer = layers[0];
+      const gj = featureToGeoJSON(currentAOILayer);
+      elAoi.value = JSON.stringify(gj, null, 2);
 
-      warningsLayer.clearLayers();
-      warnBox.style.display = 'none';
-      warnCount.textContent = '0';
-      warnTableBody.innerHTML = '';
-
+      clearWarningsUI();
+      setStatus('AOI geändert. Bitte <b>Warnungen laden</b> erneut ausführen.', 'ok');
       setButtons();
-      setStatus('AOI geändert. Note: bitte <b>Warnungen laden</b> erneut ausführen.', 'ok');
     });
 
     map.on('draw:deleted', function(){
       clearAll();
     });
 
-    btnClear.addEventListener('click', clearAll);
-
-    async function apiJson(url, body){
-      const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
+    async function apiPostJson(url, body){
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
       const raw = await res.text();
+      let js = null;
+      try { js = raw ? JSON.parse(raw) : {}; } catch(_){ js = null; }
 
-      if(!ct.includes('application/json') && !ct.includes('json')){
-        throw new Error(`Server lieferte kein JSON (HTTP ${res.status}, Content-Type=${ct}). Antwort-Auszug: ${raw.slice(0,240)}`);
-      }
-
-      const js = raw ? JSON.parse(raw) : {};
       if(!res.ok){
-        throw new Error(js && js.error ? js.error : (`HTTP ${res.status}`));
+        const msg = (js && js.error) ? js.error : (`HTTP ${res.status}. ${raw.slice(0,240)}`);
+        throw new Error(msg);
       }
+      if(js === null) throw new Error(`Server lieferte kein JSON (HTTP ${res.status}). Antwort-Auszug: ${raw.slice(0,240)}`);
       return js;
     }
 
@@ -732,14 +802,27 @@ INDEX_HTML = r"""
         return;
       }
 
-      for(const w of rows){
+      for(let i=0; i<rows.length; i++){
+        const w = rows[i] || {};
         const tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
         tr.innerHTML = `
           <td>${escapeHtml(w.kurztext || '(ohne Kurztext)')}</td>
-          <td class="mono">${escapeHtml(w.gueltig_bis_local || w.gueltig_bis || 'n/a')}</td>
+          <td class="mono">${escapeHtml(w.gueltig_bis_local || 'n/a')}</td>
           <td>${escapeHtml(w.severity ?? '')}</td>
           <td>${escapeHtml(w.gebiet ?? '')}</td>
         `;
+        tr.addEventListener('click', () => {
+          // best-effort: zoom to the i-th feature
+          try{
+            const f = (lastWarningsFC && lastWarningsFC.features) ? lastWarningsFC.features[i] : null;
+            if(f){
+              const b = L.geoJSON(f).getBounds();
+              if(b && b.isValid()) map.fitBounds(b.pad(0.15));
+              renderInfo((f.properties || {}));
+            }
+          }catch(_){}
+        });
         warnTableBody.appendChild(tr);
       }
 
@@ -747,27 +830,26 @@ INDEX_HTML = r"""
     }
 
     async function doLoad(){
-      if(!currentFeature){
+      if(!currentAOILayer){
         setStatus('Bitte zuerst eine AOI zeichnen.', 'err');
         return;
       }
 
       let gj;
-      try{ gj = JSON.parse(elGeo.value); }
-      catch(_){ setStatus('GeoJSON ist ungültig.', 'err'); return; }
+      try { gj = JSON.parse(elAoi.value); }
+      catch(_){ setStatus('AOI GeoJSON ist ungültig.', 'err'); return; }
 
-      const typeName = (elTypeName.value || '').trim() || '{{ typename_default }}';
-      const maxN = Math.max(1, Math.min(2000, parseInt(elMaxN.value || '500', 10) || 500));
+      setStatus(`Lade Warnungen vom DWD WFS… <span class="mono">${escapeHtml(FIX_TYPENAME)}</span>`, '');
+      btnLoad.disabled = true;
 
-      setButtons();
-      setStatus('Lade Warnungen vom DWD WFS…', '');
+      const data = await apiPostJson('/api/warnings', { geojson: gj });
 
-      const data = await apiJson('/api/warnings', { geojson: gj, typeName, max: maxN });
+      lastWarningsFC = data;
+      elWarn.value = JSON.stringify(data, null, 2);
 
       warningsLayer.clearLayers();
       warningsLayer.addData(data);
 
-      // fit to warnings if any, else fit to AOI
       try{
         const b = warningsLayer.getBounds();
         if(b && b.isValid()) map.fitBounds(b.pad(0.15));
@@ -776,66 +858,45 @@ INDEX_HTML = r"""
       const count = (data.meta && typeof data.meta.count === 'number') ? data.meta.count : (data.features || []).length;
       fillWarningsTable((data.meta && data.meta.summary) ? data.meta.summary : []);
 
-      setStatus(`OK: <b>${count}</b> Warnungen · typeName=<span class="mono">${escapeHtml(typeName)}</span>`, 'ok');
+      if(count === 0){
+        infoHint.textContent = 'Keine Warnungen im BBOX der AOI gefunden.';
+        infoContent.style.display = 'none';
+        infoContent.innerHTML = '';
+        setStatus(`OK: <b>0</b> Treffer · ggf. AOI anpassen oder später erneut prüfen.`, 'ok');
+      } else {
+        infoHint.textContent = 'Hover über eine Warnfläche, um Details zu sehen.';
+        setStatus(`OK: <b>${count}</b> Treffer · Layer=<span class="mono">${escapeHtml(FIX_TYPENAME)}</span>`, 'ok');
+      }
+
+      setButtons();
+      btnLoad.disabled = false;
     }
 
     async function doDownloadWarnings(){
-      if(!currentFeature){
-        setStatus('Bitte zuerst eine AOI zeichnen.', 'err');
+      if(!lastWarningsFC){
+        setStatus('Noch keine Warnungen geladen.', 'err');
         return;
       }
-
-      let gj;
-      try{ gj = JSON.parse(elGeo.value); }
-      catch(_){ setStatus('GeoJSON ist ungültig.', 'err'); return; }
-
-      const typeName = (elTypeName.value || '').trim() || '{{ typename_default }}';
-      const maxN = Math.max(1, Math.min(2000, parseInt(elMaxN.value || '500', 10) || 500));
-
-      setStatus('Erstelle Download…', '');
-
-      const res = await fetch('/api/warnings', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ geojson: gj, typeName, max: maxN })
-      });
-
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      const blob = await res.blob();
-
-      if(!res.ok){
-        let msg = `HTTP ${res.status}`;
-        try{
-          if(ct.includes('json')){
-            const txt = await blob.text();
-            const js = JSON.parse(txt);
-            msg = js && js.error ? js.error : msg;
-          }
-        }catch(_){}
-        setStatus('Fehler: ' + escapeHtml(msg), 'err');
-        return;
-      }
-
-      const fn = `${'{{ service_slug }}'}_${typeName.replaceAll(':','_')}.geojson`;
+      const blob = new Blob([JSON.stringify(lastWarningsFC, null, 2)], { type: 'application/geo+json' });
+      const fn = `${SERVICE_SLUG}_${FIX_TYPENAME.replaceAll(':','_')}.geojson`;
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = fn;
       document.body.appendChild(a);
       a.click();
       a.remove();
-
-      setStatus('Download gestartet.', 'ok');
+      setStatus('Warnungen-Download gestartet.', 'ok');
     }
 
     function doDownloadAOI(){
-      if(!currentFeature){
+      if(!currentAOILayer){
         setStatus('Keine AOI vorhanden.', 'err');
         return;
       }
-      const blob = new Blob([elGeo.value || ''], { type: 'application/geo+json' });
+      const blob = new Blob([elAoi.value || ''], { type: 'application/geo+json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = '{{ service_slug }}_aoi_epsg4326.geojson';
+      a.download = `${SERVICE_SLUG}_aoi_epsg4326.geojson`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -859,8 +920,9 @@ def index():
         INDEX_HTML,
         title=APP_TITLE,
         service_slug=SERVICE_SLUG,
-        typename_default=DWD_TYPENAME_DEFAULT,
-        max_default=MAX_FEATURES_DEFAULT,
+        service_slug_json=json.dumps(SERVICE_SLUG),
+        typename=DWD_TYPENAME,
+        typename_json=json.dumps(DWD_TYPENAME),
     )
 
 
@@ -870,4 +932,4 @@ def index():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
