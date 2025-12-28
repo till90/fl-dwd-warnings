@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+API:
+- POST /api/warnings -> Gibt DWD-Warnungen für ein bestimmtes GeoJSON-Gebiet zurück
+- GET /healthz      -> Überprüft den Zustand des Dienstes
+"""
+"""
 fl-dwd-warnings (WFS) – DWD Warnpolygone (fixer Layer)
 - Web UI: AOI zeichnen (1 Feature) -> passende Warnungen (dwd:Warnungen_Gemeinden_vereinigt) laden
          -> Warnungen auf Karte + Hover/Infobox + GeoJSON anzeigen + Download
